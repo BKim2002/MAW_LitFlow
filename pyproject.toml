@@ -7,12 +7,14 @@ dependencies = [
   "openpyxl",
   "python-docx",
   "pydantic",
+  "pypdf",
 ]
 
 [project.optional-dependencies]
 agents = ["openai-agents"]
 notion = ["notion-client"]
-all = ["openai-agents", "notion-client"]
+pdf = ["pypdf"]
+all = ["openai-agents", "notion-client", "pypdf"]
 
 [tool.setuptools.packages.find]
 include = ["litflow*"]

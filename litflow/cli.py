@@ -21,6 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--user-files", default=None)
     run.add_argument("--agent-mode", choices=["auto", "sdk", "off"], default="auto", help="Use Agents SDK for judgment-heavy stages: auto, sdk, or off.")
     run.add_argument("--agent-model", default=None, help="Optional OpenAI model name for Agents SDK runs. Defaults to the SDK/provider default.")
+    run.add_argument("--recall-mode", choices=["fast", "balanced", "high"], default="high", help="Search recall depth. high runs broader facet queries and recall audits.")
+    run.add_argument("--web-search-provider", choices=["serpapi", "none"], default="serpapi", help="Optional web/scholar search provider for round-2 recall expansion.")
+    run.add_argument("--web-search-token-env", default="SERPAPI_API_KEY", help="Environment variable that contains the web search provider API key.")
     run.add_argument("--output-format", choices=["files", "notion", "both"], default="files", help="Final packaging target: local DOCX/XLSX files, Notion, or both.")
     run.add_argument("--notion-parent", default=None, help="Notion parent page URL or ID for creating a new run hub page.")
     run.add_argument("--notion-run-page", default=None, help="Existing Notion run hub page URL or ID to update.")
@@ -42,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
             user_files=args.user_files,
             agent_mode=args.agent_mode,
             agent_model=args.agent_model,
+            recall_mode=args.recall_mode,
+            web_search_provider=args.web_search_provider,
+            web_search_token_env=args.web_search_token_env,
             output_format=args.output_format,
             notion_parent=args.notion_parent,
             notion_run_page=args.notion_run_page,

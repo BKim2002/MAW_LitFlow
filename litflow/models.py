@@ -17,6 +17,9 @@ class RunConfig:
     per_source_cap: int = 300
     agent_mode: str = "auto"
     agent_model: str | None = None
+    recall_mode: str = "high"
+    web_search_provider: str = "serpapi"
+    web_search_token_env: str = "SERPAPI_API_KEY"
     output_format: str = "files"
     notion_parent: str | None = None
     notion_run_page: str | None = None
@@ -31,6 +34,8 @@ class SearchQuery:
     source: str
     query: str
     intent: str
+    search_round: int = 1
+    facets: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -50,6 +55,9 @@ class RawRecord:
     citation_count: int | None = None
     source_database: str = ""
     open_access_pdf: str = ""
+    found_by: str = ""
+    search_round: int = 1
+    facet_matches: list[str] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -75,6 +83,10 @@ class Record:
     exclusion_reason: str = ""
     summary_status: str = "pending"
     open_access_pdf: str = ""
+    found_by: list[str] = field(default_factory=list)
+    search_round: int = 1
+    facet_matches: list[str] = field(default_factory=list)
+    coverage_warning: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

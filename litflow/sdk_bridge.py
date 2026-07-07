@@ -158,6 +158,9 @@ class SDKAgentBridge:
                     "venue": r.venue,
                     "year": r.year,
                     "source_database": r.source_database,
+                    "found_by": r.found_by,
+                    "search_round": r.search_round,
+                    "facet_matches": r.facet_matches,
                     "deterministic_score": r.relevance_score,
                 }
                 for r in records
@@ -170,8 +173,10 @@ class SDKAgentBridge:
             "Literature Deep Summary Agent",
             (
                 "You write detailed Korean structured summaries of scholarly papers. "
-                "Use only the provided evidence. If evidence_level is metadata_only or abstract_only, "
-                "explicitly say what cannot be verified. Do not invent methods, results, or conclusions. "
+                "Use only the provided evidence. If fulltext_sections or fulltext_excerpt are present, "
+                "use that extracted full text as the primary evidence. If evidence_level is metadata_only "
+                "or abstract_only, explicitly say what cannot be verified. Do not invent methods, "
+                "results, or conclusions beyond the available evidence. "
                 "The summary should help a researcher understand the paper's full structure at a glance."
             ),
             LiteratureSummaryOutput,

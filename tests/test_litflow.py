@@ -3,11 +3,13 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from openpyxl import load_workbook
 
 from litflow.agents import (
+    CoverageAuditAgent,
     DeepSummaryAgent,
     EvidenceAcquisitionAgent,
     IntakeScopeAgent,
@@ -15,8 +17,9 @@ from litflow.agents import (
     QualityAuditAgent,
     QueryStrategyAgent,
     RelevanceScreeningAgent,
+    extract_elsevier_pii,
 )
-from litflow.connectors import BaseConnector, SearchResult
+from litflow.connectors import BaseConnector, SearchResult, SerpApiGoogleScholarConnector
 from litflow.models import RawRecord, Record, RunConfig, SearchLogEntry
 from litflow.notion_writer import NotionPackagingAgent, hub_page_blocks, parse_notion_page_id, rich_text, summary_record_to_blocks
 from litflow.orchestrator import Orchestrator
@@ -170,6 +173,77 @@ class LitflowTests(unittest.TestCase):
             self.assertIn("assessment", expanded)
             self.assertIn("competency", expanded)
 
+    def test_high_recall_korean_topic_generates_faceted_queries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            config = RunConfig(topic="생성형 AI 활용 역량 혹은 AI Literacy와 직무성과와의 관계를 다룬 연구", out=tmp, recall_mode="high")
+            scope = IntakeScopeAgent().run(config, out)
+            plan = QueryStrategyAgent().run(scope, config, out)
+            groups = plan["concept_groups"]
+            self.assertIn("AI literacy", groups["core_concepts"])
+            self.assertIn("job performance", groups["outcome_terms"])
+            self.assertIn("workplace", groups["context_terms"])
+            queries = plan["queries"]
+            self.assertTrue(any(q["intent"] == "core_outcome" for q in queries))
+            self.assertTrue(any(q["source"] == "serpapi_google_scholar" and q["search_round"] == 2 for q in queries))
+            self.assertTrue(any("job performance" in q["query"] for q in queries))
+
+    def test_coverage_audit_generates_supplemental_queries_for_weak_facets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            config = RunConfig(topic="AI literacy job performance", out=tmp, recall_mode="high")
+            scope = IntakeScopeAgent().run(config, out)
+            plan = QueryStrategyAgent().run(scope, config, out)
+            record = Record(
+                record_id="r1",
+                title="AI Literacy Scale Development",
+                abstract="This paper validates an AI literacy scale.",
+                relevance_score=3,
+                inclusion_status="included",
+            )
+            report = CoverageAuditAgent().run([record], plan, config, out, allow_supplemental=True)
+            self.assertTrue(report["warnings"])
+            self.assertTrue(report["supplemental_queries"])
+            self.assertIn("outcome_terms", report["supplemental_queries"][0]["facets"])
+            screened = read_jsonl(out / "screened_records.jsonl")[0]
+            self.assertIn("facet_matches", screened)
+            self.assertIn("coverage_warning", screened)
+
+    def test_serpapi_missing_token_logs_warning(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = RunConfig(topic="AI literacy", out=tmp, web_search_token_env="LITFLOW_MISSING_SERPAPI_TOKEN")
+            result = SerpApiGoogleScholarConnector().search("AI literacy job performance", config, 5)
+            self.assertEqual(result.records, [])
+            self.assertIn("LITFLOW_MISSING_SERPAPI_TOKEN is not set", result.log.error)
+
+    def test_serpapi_fixture_normalizes_google_scholar_result(self):
+        fixture = {
+            "organic_results": [
+                {
+                    "result_id": "scholar-1",
+                    "title": "Generative AI Literacy and Job Performance",
+                    "link": "https://example.test/paper",
+                    "snippet": "This study examines generative AI literacy and employee job performance.",
+                    "publication_info": {
+                        "summary": "Kim, Lee - Journal of Work, 2025",
+                        "authors": [{"name": "Kim"}, {"name": "Lee"}],
+                    },
+                    "inline_links": {"cited_by": {"total": 12}},
+                    "resources": [{"file_format": "PDF", "link": "https://example.test/paper.pdf"}],
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            config = RunConfig(topic="AI literacy", out=tmp, web_search_token_env="SERPAPI_TEST_KEY")
+            with patch.dict("os.environ", {"SERPAPI_TEST_KEY": "test-key"}), patch.object(SerpApiGoogleScholarConnector, "_get_json", return_value=fixture):
+                result = SerpApiGoogleScholarConnector().search("AI literacy job performance", config, 5)
+            self.assertEqual(len(result.records), 1)
+            record = result.records[0]
+            self.assertEqual(record.source, "serpapi_google_scholar")
+            self.assertEqual(record.year, 2025)
+            self.assertEqual(record.citation_count, 12)
+            self.assertEqual(record.open_access_pdf, "https://example.test/paper.pdf")
+
     def test_dedup_merges_same_doi(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -203,6 +277,55 @@ class LitflowTests(unittest.TestCase):
             self.assertEqual(record.evidence_level, "abstract_only")
             self.assertIn("초록", summaries[0]["method"])
             self.assertIn("추정하지 않습니다", summaries[0]["results_findings"])
+
+    def test_evidence_acquisition_extracts_pdf_fulltext_for_deep_targets(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            record = Record(
+                record_id="r1",
+                title="AI Literacy Full Text Study",
+                abstract="This abstract is available.",
+                open_access_pdf="https://example.test/paper.pdf",
+                relevance_score=3,
+                inclusion_status="included",
+                citation_count=10,
+            )
+            pdf_text = """
+Abstract
+This paper studies AI literacy.
+
+Introduction
+AI literacy matters for work and learning.
+
+Methods
+Participants completed a survey and performance task.
+
+Results
+AI literacy predicted better task outcomes.
+
+Conclusion
+AI literacy should be developed through training.
+"""
+            with patch("litflow.agents.download_pdf", return_value=out / "fake.pdf"), patch("litflow.agents.extract_pdf_text", return_value=pdf_text):
+                config = RunConfig(topic="AI literacy job performance", out=tmp, max_deep=1)
+                evidence = EvidenceAcquisitionAgent().run([record], config, out)
+            bundle = evidence["r1"]
+            self.assertEqual(record.evidence_level, "fulltext_pdf")
+            self.assertEqual(bundle["fulltext_status"], "completed")
+            self.assertIn("Participants completed", bundle["fulltext_sections"]["method"])
+            summaries = DeepSummaryAgent().run([record], evidence, config, out)
+            self.assertIn("Participants completed", summaries[0]["method"])
+            self.assertIn("AI literacy predicted", summaries[0]["results_findings"])
+
+    def test_extract_elsevier_pii_from_crossref_links(self):
+        self.assertEqual(
+            extract_elsevier_pii("https://api.elsevier.com/content/article/PII:S2666920X24000262?httpAccept=text/xml"),
+            "S2666920X24000262",
+        )
+        self.assertEqual(
+            extract_elsevier_pii("https://www.sciencedirect.com/science/article/pii/S2666557324000247"),
+            "S2666557324000247",
+        )
 
     def test_packaging_creates_required_xlsx_sheets_and_docx(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -275,6 +398,9 @@ class LitflowTests(unittest.TestCase):
             self.assertEqual(manifest["stages"][-1]["name"], "packaging")
             included = [r for r in read_jsonl(out / "screened_records.jsonl") if r["inclusion_status"] == "included"]
             self.assertEqual(len(included), 1)
+            self.assertTrue(included[0]["found_by"])
+            self.assertGreaterEqual(included[0]["search_round"], 1)
+            self.assertIn("facet_matches", included[0])
 
     def test_sdk_assisted_agents_use_bridge_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -272,6 +274,89 @@ class WebSearchConnector(BaseConnector):
         return SearchResult([], log)
 
 
+class SerpApiGoogleScholarConnector(BaseConnector):
+    source = "serpapi_google_scholar"
+    base_url = "https://serpapi.com/search.json"
+
+    def search(self, query: str, config: RunConfig, limit: int) -> SearchResult:
+        token = os.environ.get(config.web_search_token_env)
+        params = {
+            "engine": "google_scholar",
+            "q": query,
+            "num": str(min(limit, 20)),
+        }
+        endpoint = f"{self.base_url}?{urllib.parse.urlencode(params)}"
+        if not token:
+            log = SearchLogEntry(
+                self.source,
+                query,
+                utc_now(),
+                endpoint,
+                0,
+                f"{config.web_search_token_env} is not set; SerpAPI Google Scholar search skipped.",
+            )
+            return SearchResult([], log)
+        params["api_key"] = token
+        endpoint_with_key = f"{self.base_url}?{urllib.parse.urlencode(params)}"
+        endpoint_for_log = endpoint_with_key.replace(token, "***")
+        try:
+            data = self._get_json(endpoint_with_key)
+            if data.get("error"):
+                return SearchResult([], SearchLogEntry(self.source, query, utc_now(), endpoint_for_log, 0, str(data["error"])))
+            rows = data.get("organic_results") or []
+            records = [self._parse_result(item) for item in rows[:limit]]
+            return SearchResult(records, SearchLogEntry(self.source, query, utc_now(), endpoint_for_log, len(records)))
+        except Exception as exc:
+            return SearchResult([], SearchLogEntry(self.source, query, utc_now(), endpoint_for_log, 0, self._safe_error(exc)))
+
+    def _parse_result(self, item: dict[str, Any]) -> RawRecord:
+        publication = item.get("publication_info") or {}
+        resources = item.get("resources") or []
+        pdf = ""
+        for resource in resources:
+            link = resource.get("link") or ""
+            file_format = str(resource.get("file_format") or "").lower()
+            if link and ("pdf" in file_format or link.lower().endswith(".pdf")):
+                pdf = link
+                break
+        summary = clean_text(publication.get("summary"))
+        year = parse_year(summary) or parse_year(item.get("snippet"))
+        authors = []
+        for author in publication.get("authors") or []:
+            name = clean_text(author.get("name"))
+            if name:
+                authors.append(name)
+        cited_by = ((item.get("inline_links") or {}).get("cited_by") or {}).get("total")
+        return RawRecord(
+            source=self.source,
+            source_id=item.get("result_id") or item.get("link") or item.get("title") or "",
+            title=clean_text(item.get("title")),
+            authors=authors or parse_authors_from_scholar_summary(summary),
+            year=year,
+            venue=summary,
+            doi="",
+            abstract=clean_text(item.get("snippet")),
+            url=item.get("link") or "",
+            citation_count=int(cited_by) if isinstance(cited_by, int) or str(cited_by).isdigit() else None,
+            source_database=self.source,
+            open_access_pdf=pdf,
+            extra={"publication_info": publication, "inline_links": item.get("inline_links"), "resources": resources},
+        )
+
+
+def parse_year(text: Any) -> int | None:
+    match = re.search(r"\b(19|20)\d{2}\b", str(text or ""))
+    return int(match.group(0)) if match else None
+
+
+def parse_authors_from_scholar_summary(summary: str) -> list[str]:
+    if not summary:
+        return []
+    before_dash = re.split(r"\s+-\s+", summary, maxsplit=1)[0]
+    pieces = [clean_text(piece) for piece in re.split(r",| and ", before_dash) if clean_text(piece)]
+    return pieces[:8]
+
+
 def inverted_index_to_text(index: dict[str, list[int]]) -> str:
     if not index:
         return ""
@@ -289,4 +374,5 @@ def default_connectors() -> dict[str, BaseConnector]:
         "semantic_scholar": SemanticScholarConnector(),
         "arxiv": ArxivConnector(),
         "web": WebSearchConnector(),
+        "serpapi_google_scholar": SerpApiGoogleScholarConnector(),
     }

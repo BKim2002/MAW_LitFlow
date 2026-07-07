@@ -246,6 +246,10 @@ def summary_record_to_blocks(summary: dict[str, Any], record: Record) -> list[di
         ("Evidence Level", summary.get("evidence_level") or record.evidence_level),
         ("Relevance Score", record.relevance_score),
         ("Source Databases", "; ".join(record.source_database)),
+        ("Found By", "; ".join(record.found_by)),
+        ("Search Round", record.search_round),
+        ("Facet Matches", "; ".join(record.facet_matches)),
+        ("Coverage Warning", record.coverage_warning),
         ("Record ID", record.record_id),
     ]
     sections = [

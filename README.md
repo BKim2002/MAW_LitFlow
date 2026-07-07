@@ -45,12 +45,15 @@ Search scope and volume:
 
 | Option | Default | When to use |
 |---|---:|---|
+| `--recall-mode` | `high` | Controls search breadth: `fast`, `balanced`, or `high`. `high` runs broader facet queries, coverage audit, supplemental queries, and snowballing. |
+| `--web-search-provider` | `serpapi` | Use `serpapi` for Google Scholar-style round-2 recall expansion, or `none` to skip web/scholar API calls. |
+| `--web-search-token-env` | `SERPAPI_API_KEY` | Environment-variable name that stores the SerpAPI key. If missing, litflow logs a warning and continues with public scholarly APIs. |
 | `--year-from` | none | Limit results to papers published from this year onward. Example: `--year-from 2020`. |
 | `--year-to` | none | Limit results to papers published up to this year. Example: `--year-to 2026`. |
 | `--language` | `ko` | Output-language setting for generated artifacts. Metadata such as titles, venues, and DOI values keep their original notation. |
 | `--max-raw` | `1500` | Upper budget for the raw candidate pool before deduplication. Use a smaller value for smoke tests. |
-| `--max-deep` | `50` | Maximum number of included records to receive long structured summaries and paper-level Notion pages. |
-| `--user-files` | none | Directory containing user-provided full-text files. Matching files raise the evidence level to `user_provided_fulltext`. |
+| `--max-deep` | `50` | Maximum number of included records to receive long structured summaries, PDF full-text extraction attempts, and paper-level Notion pages. |
+| `--user-files` | none | Directory containing user-provided full-text files. Matching PDF/TXT/MD files are extracted and raise the evidence level to `user_provided_fulltext`. |
 
 Agents SDK options:
 
@@ -76,6 +79,8 @@ python -m litflow run `
   --out outputs/litflow-demo `
   --year-from 2020 `
   --year-to 2026 `
+  --recall-mode high `
+  --web-search-provider serpapi `
   --max-raw 500 `
   --max-deep 30 `
   --agent-mode auto `
@@ -112,6 +117,47 @@ The Notion output uses native Notion blocks to keep the result calm and scannabl
 summary callouts, dividers, clear heading hierarchy, a paper-link map, and
 evidence-level callouts on each paper page.
 
+## PDF Full Text
+
+For included records that are selected for deep summary, litflow tries to discover
+and download an accessible PDF, extract text with `pypdf`, and pass extracted
+sections to the summary agent. When extraction succeeds, the record evidence level
+becomes `fulltext_pdf`; otherwise it falls back to abstract or metadata evidence.
+Publisher login walls, bot protection, and non-PDF HTML full text can still prevent
+automatic extraction even when the paper is readable in a browser.
+
+## High-Recall Search
+
+The default `--recall-mode high` changes search from a one-pass query into a
+facet-based recall workflow. Litflow decomposes the topic into concept facets
+such as core concepts, outcomes, workplace/context terms, and method terms. For
+example, a Korean topic about generative AI literacy and job performance creates
+queries that include terms such as `AI literacy`, `generative AI literacy`,
+`job performance`, `productivity`, `employee`, `workplace`, `scale development`,
+and `validation`.
+
+Search proceeds in rounds:
+
+- Round 1: OpenAlex, Crossref, Semantic Scholar, and arXiv.
+- Round 2: optional SerpAPI Google Scholar-style search and coverage-triggered supplemental queries.
+- Round 3: Semantic Scholar citation/reference snowballing from core records.
+
+Every candidate keeps `found_by`, `search_round`, `facet_matches`, and
+`coverage_warning` fields. These fields appear in `screened_records.jsonl`, the
+XLSX candidate sheets, and Notion paper pages. `coverage_audit.md` summarizes
+facet coverage, weak concept combinations, search rounds, source counts, and
+remaining manual database gaps.
+
+To enable SerpAPI in PowerShell:
+
+```powershell
+$env:SERPAPI_API_KEY = "your-serpapi-key"
+python -m litflow run --topic "AI literacy and job performance" --out outputs/ai-literacy --recall-mode high --web-search-provider serpapi
+```
+
+If `SERPAPI_API_KEY` is not set, the workflow does not fail. It writes a clear
+warning to `search_log.jsonl` and continues with the public scholarly connectors.
+
 ## Outputs
 
 - `run_manifest.json`
@@ -124,6 +170,7 @@ evidence-level callouts on each paper page.
 - `dedup_report.json`
 - `screened_records.jsonl`
 - `evidence_bundles/*.json`
+- `fulltext_pdfs/*.pdf` when PDF extraction succeeds
 - `summaries.jsonl`
 - `qa_flags.jsonl`
 - `coverage_audit.md`
@@ -134,8 +181,10 @@ evidence-level callouts on each paper page.
 ## Notes
 
 - Public automated connectors: OpenAlex, Crossref, Semantic Scholar, arXiv.
-- General web search and paid scholarly databases are represented through
-  reproducible manual search strings in `manual_db_search_pack.md`.
+- Optional web/scholar connector: SerpAPI Google Scholar-style search when
+  `SERPAPI_API_KEY` is available.
+- Paid scholarly databases are represented through reproducible manual search
+  strings in `manual_db_search_pack.md`.
 - DOCX output intentionally omits URLs to avoid fragile Word hyperlink handling;
   URLs are preserved in the XLSX workbook.
 - Notion output uses the official Notion API through `notion-client`, not the

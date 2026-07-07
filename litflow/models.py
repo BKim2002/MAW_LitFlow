@@ -17,6 +17,10 @@ class RunConfig:
     per_source_cap: int = 300
     agent_mode: str = "auto"
     agent_model: str | None = None
+    output_format: str = "files"
+    notion_parent: str | None = None
+    notion_run_page: str | None = None
+    notion_token_env: str = "NOTION_TOKEN"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

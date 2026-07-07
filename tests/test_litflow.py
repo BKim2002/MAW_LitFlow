@@ -18,6 +18,7 @@ from litflow.agents import (
 )
 from litflow.connectors import BaseConnector, SearchResult
 from litflow.models import RawRecord, Record, RunConfig, SearchLogEntry
+from litflow.notion_writer import NotionPackagingAgent, hub_page_blocks, parse_notion_page_id, rich_text, summary_record_to_blocks
 from litflow.orchestrator import Orchestrator
 from litflow.sdk_bridge import LiteratureSummaryOutput, QABatchOutput, QAFlagOutput, QueryStrategyOutput, RelevanceBatchOutput, RelevanceDecision
 from litflow.utils import read_json, read_jsonl, utc_now, write_json, write_jsonl
@@ -71,6 +72,92 @@ class FakeSDKBridge:
 
     def audit_quality(self, topic, records, summaries, existing_flags):
         return QABatchOutput(flags=[QAFlagOutput(record_id=records[0].record_id, title=records[0].title, code="sdk_flag", message="fake sdk flag")])
+
+
+class FakeNotionClient:
+    def __init__(self):
+        self.pages_data = {}
+        self.children = {}
+        self.page_counter = 0
+        self.block_counter = 0
+        self.created_pages = []
+        self.updated_pages = []
+        self.deleted_blocks = []
+        self.pages = FakeNotionPages(self)
+        self.blocks = FakeNotionBlocks(self)
+
+    def next_page_id(self):
+        self.page_counter += 1
+        return f"page{self.page_counter:032d}"[-32:]
+
+    def next_block_id(self):
+        self.block_counter += 1
+        return f"block{self.block_counter:032d}"
+
+    def page_title(self, properties):
+        rich = properties["title"][0]["text"]["content"]
+        return rich
+
+
+class FakeNotionPages:
+    def __init__(self, client):
+        self.client = client
+
+    def create(self, parent, properties):
+        page_id = self.client.next_page_id()
+        title = self.client.page_title(properties)
+        page = {"id": page_id, "url": f"https://notion.test/{page_id}", "properties": properties, "title": title}
+        self.client.pages_data[page_id] = page
+        self.client.children.setdefault(page_id, [])
+        self.client.created_pages.append(page_id)
+        parent_id = parent.get("page_id")
+        if parent_id:
+            block_id = self.client.next_block_id()
+            self.client.children.setdefault(parent_id, []).append({"id": block_id, "type": "child_page", "child_page": {"title": title}, "page_id": page_id})
+        return page
+
+    def update(self, page_id, properties):
+        self.client.pages_data.setdefault(page_id, {"id": page_id, "url": f"https://notion.test/{page_id}"})
+        self.client.pages_data[page_id]["properties"] = properties
+        self.client.pages_data[page_id]["title"] = self.client.page_title(properties)
+        self.client.updated_pages.append(page_id)
+        return self.client.pages_data[page_id]
+
+
+class FakeNotionChildren:
+    def __init__(self, client):
+        self.client = client
+
+    def list(self, block_id, page_size=100, start_cursor=None):
+        rows = self.client.children.get(block_id, [])
+        start = int(start_cursor or 0)
+        page = rows[start : start + page_size]
+        next_cursor = start + page_size if start + page_size < len(rows) else None
+        return {"results": page, "has_more": next_cursor is not None, "next_cursor": str(next_cursor) if next_cursor is not None else None}
+
+    def append(self, block_id, children):
+        stored = self.client.children.setdefault(block_id, [])
+        for block in children:
+            row = dict(block)
+            row.setdefault("id", self.client.next_block_id())
+            stored.append(row)
+        return {"results": children}
+
+
+class FakeNotionBlocks:
+    def __init__(self, client):
+        self.client = client
+        self.children = FakeNotionChildren(client)
+
+    def delete(self, block_id):
+        for rows in self.client.children.values():
+            for idx, row in enumerate(list(rows)):
+                if row.get("id") == block_id:
+                    rows.pop(idx)
+                    self.client.deleted_blocks.append(block_id)
+                    return {"id": block_id, "archived": True}
+        self.client.deleted_blocks.append(block_id)
+        return {"id": block_id, "archived": True}
 
 
 class LitflowTests(unittest.TestCase):
@@ -210,6 +297,128 @@ class LitflowTests(unittest.TestCase):
             self.assertEqual(summaries[0]["abstract"], "SDK abstract summary")
             flags = QualityAuditAgent(bridge).run(records, summaries, out, config.topic)
             self.assertEqual(flags[-1]["code"], "sdk_flag")
+
+    def test_notion_page_id_parsing_and_rich_text_chunking(self):
+        self.assertEqual(parse_notion_page_id("https://www.notion.so/Research-Hub-1234567890abcdef1234567890abcdef?pvs=4"), "1234567890abcdef1234567890abcdef")
+        self.assertEqual(parse_notion_page_id("12345678-90ab-cdef-1234-567890abcdef"), "1234567890abcdef1234567890abcdef")
+        chunks = rich_text("a" * 4100)
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(all(len(item["text"]["content"]) <= 1900 for item in chunks))
+
+    def test_summary_record_to_notion_blocks_contains_sections(self):
+        record = Record(record_id="r1", title="AI Assessment Validity", authors=["Kim"], year=2026, venue="Journal", evidence_level="abstract_only")
+        summary = {
+            "record_id": "r1",
+            "citation": "Kim (2026). AI Assessment Validity.",
+            "title": "AI Assessment Validity",
+            "evidence_level": "abstract_only",
+            "abstract": "Abstract summary",
+            "introduction": "Intro summary",
+            "method": "Method summary",
+            "results_findings": "Findings summary",
+            "conclusion": "Conclusion summary",
+            "limitations": "Limitations summary",
+            "topic_relevance": "Relevant",
+            "follow_up": "Review full text",
+        }
+        blocks = summary_record_to_blocks(summary, record)
+        block_types = [block["type"] for block in blocks]
+        self.assertIn("callout", block_types)
+        self.assertIn("divider", block_types)
+        self.assertIn("heading_1", block_types)
+        self.assertIn("heading_2", block_types)
+        rendered = str(blocks)
+        self.assertIn("Evidence Level", rendered)
+        self.assertIn("Abstract summary", rendered)
+        self.assertIn("Method summary", rendered)
+
+    def test_hub_page_blocks_use_notion_native_design_structure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            write_json(out / "query_plan.json", {"queries": [{"source": "openalex", "query": "AI assessment", "intent": "test"}]})
+            write_jsonl(out / "search_log.jsonl", [{"source": "openalex", "query": "AI", "result_count": 1}])
+            write_json(out / "run_manifest.json", {"agents_sdk": {"enabled": False}})
+            (out / "coverage_audit.md").write_text("Included records: 1\nQA flags: 0\n", encoding="utf-8")
+            record = Record(record_id="r1", title="AI Assessment", relevance_score=3, inclusion_status="included", evidence_level="abstract_only")
+            summary = {"record_id": "r1", "citation": "Kim (2026). AI Assessment.", "title": "AI Assessment"}
+            blocks = hub_page_blocks(
+                [record],
+                [summary],
+                [],
+                RunConfig(topic="AI assessment", out=tmp),
+                out,
+                {"r1": {"url": "https://notion.test/paper", "page_id": "child1", "title": "Paper"}},
+            )
+            block_types = [block["type"] for block in blocks]
+            self.assertIn("callout", block_types)
+            self.assertIn("divider", block_types)
+            self.assertLess(block_types.index("heading_1"), len(block_types))
+            rendered = str(blocks)
+            self.assertIn("실행 요약", rendered)
+            self.assertIn("핵심 문헌 맵", rendered)
+            self.assertIn("https://notion.test/paper", rendered)
+
+    def test_notion_packaging_creates_and_updates_manifest_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            write_json(out / "query_plan.json", {"queries": [{"source": "openalex", "query": "AI assessment", "intent": "test"}]})
+            write_jsonl(out / "search_log.jsonl", [{"source": "openalex", "query": "AI", "result_count": 1}])
+            write_json(out / "run_manifest.json", {"agents_sdk": {"enabled": False}})
+            (out / "coverage_audit.md").write_text("Included records: 1\nQA flags: 0\n", encoding="utf-8")
+            record = Record(
+                record_id="r1",
+                title="AI Assessment Validity",
+                authors=["Kim"],
+                year=2026,
+                venue="Journal",
+                relevance_score=3,
+                inclusion_status="included",
+                evidence_level="abstract_only",
+                source_database=["openalex"],
+            )
+            summary = {
+                "record_id": "r1",
+                "citation": "Kim (2026). AI Assessment Validity.",
+                "title": "AI Assessment Validity",
+                "evidence_level": "abstract_only",
+                "abstract": "Abstract",
+                "introduction": "Intro",
+                "method": "Method",
+                "results_findings": "Findings",
+                "conclusion": "Conclusion",
+                "limitations": "Limitations",
+                "topic_relevance": "Relevant",
+                "follow_up": "Review full text.",
+            }
+            fake = FakeNotionClient()
+            config = RunConfig(topic="AI assessment", out=tmp, output_format="notion", notion_parent="1234567890abcdef1234567890abcdef")
+            outputs = PackagingAgent(notion_client=fake).run([record], [summary], [], config, out)
+            self.assertIn("notion", outputs)
+            self.assertFalse((out / "literature_review.xlsx").exists())
+            self.assertFalse((out / "literature_review.docx").exists())
+            manifest = read_json(out / "notion_manifest.json")
+            hub_id = manifest["hub_page_id"]
+            child_id = manifest["child_pages"]["r1"]["page_id"]
+            self.assertIn(hub_id, fake.pages_data)
+            self.assertIn(child_id, fake.pages_data)
+
+            summary["abstract"] = "Updated abstract"
+            PackagingAgent(notion_client=fake).run([record], [summary], [], config, out)
+            updated = read_json(out / "notion_manifest.json")
+            self.assertEqual(updated["hub_page_id"], hub_id)
+            self.assertEqual(updated["child_pages"]["r1"]["page_id"], child_id)
+            self.assertIn(hub_id, fake.updated_pages)
+            self.assertIn(child_id, fake.updated_pages)
+
+    def test_notion_packaging_requires_token_or_parent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = RunConfig(topic="AI assessment", out=tmp, output_format="notion", notion_token_env="LITFLOW_MISSING_TOKEN_FOR_TEST")
+            with self.assertRaisesRegex(RuntimeError, "LITFLOW_MISSING_TOKEN_FOR_TEST"):
+                PackagingAgent().run([], [], [], config, Path(tmp))
+
+            config = RunConfig(topic="AI assessment", out=tmp, output_format="notion")
+            with self.assertRaisesRegex(RuntimeError, "--notion-parent"):
+                PackagingAgent(notion_client=FakeNotionClient()).run([], [], [], config, Path(tmp))
 
 
 if __name__ == "__main__":

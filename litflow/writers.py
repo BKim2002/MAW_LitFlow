@@ -18,19 +18,30 @@ from docx.shared import Inches, Pt, RGBColor
 
 from .agents import format_citation
 from .models import Record, RunConfig
+from .notion_writer import NotionPackagingAgent
 from .utils import ensure_dir, read_json, read_jsonl
 
 
 class PackagingAgent:
     name = "PackagingAgent"
 
+    def __init__(self, notion_client: Any | None = None) -> None:
+        self.notion_client = notion_client
+
     def run(self, records: list[Record], summaries: list[dict[str, Any]], flags: list[dict[str, Any]], config: RunConfig, out_dir: Path) -> dict[str, str]:
-        xlsx_path = out_dir / "literature_review.xlsx"
-        docx_path = out_dir / "literature_review.docx"
-        write_xlsx(xlsx_path, records, summaries, flags, config, out_dir)
-        write_docx(docx_path, records, summaries, flags, config, out_dir)
-        audit_docx_structure(docx_path)
-        return {"xlsx": str(xlsx_path), "docx": str(docx_path)}
+        outputs: dict[str, str] = {}
+        if config.output_format not in {"files", "notion", "both"}:
+            raise RuntimeError(f"Unsupported output_format: {config.output_format}")
+        if config.output_format in {"files", "both"}:
+            xlsx_path = out_dir / "literature_review.xlsx"
+            docx_path = out_dir / "literature_review.docx"
+            write_xlsx(xlsx_path, records, summaries, flags, config, out_dir)
+            write_docx(docx_path, records, summaries, flags, config, out_dir)
+            audit_docx_structure(docx_path)
+            outputs.update({"xlsx": str(xlsx_path), "docx": str(docx_path)})
+        if config.output_format in {"notion", "both"}:
+            outputs.update(NotionPackagingAgent(self.notion_client).run(records, summaries, flags, config, out_dir))
+        return outputs
 
 
 def write_xlsx(path: Path, records: list[Record], summaries: list[dict[str, Any]], flags: list[dict[str, Any]], config: RunConfig, out_dir: Path) -> None:

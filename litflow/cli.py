@@ -21,6 +21,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--user-files", default=None)
     run.add_argument("--agent-mode", choices=["auto", "sdk", "off"], default="auto", help="Use Agents SDK for judgment-heavy stages: auto, sdk, or off.")
     run.add_argument("--agent-model", default=None, help="Optional OpenAI model name for Agents SDK runs. Defaults to the SDK/provider default.")
+    run.add_argument("--output-format", choices=["files", "notion", "both"], default="files", help="Final packaging target: local DOCX/XLSX files, Notion, or both.")
+    run.add_argument("--notion-parent", default=None, help="Notion parent page URL or ID for creating a new run hub page.")
+    run.add_argument("--notion-run-page", default=None, help="Existing Notion run hub page URL or ID to update.")
+    run.add_argument("--notion-token-env", default="NOTION_TOKEN", help="Environment variable that contains the Notion integration token.")
     return parser
 
 
@@ -38,10 +42,14 @@ def main(argv: list[str] | None = None) -> int:
             user_files=args.user_files,
             agent_mode=args.agent_mode,
             agent_model=args.agent_model,
+            output_format=args.output_format,
+            notion_parent=args.notion_parent,
+            notion_run_page=args.notion_run_page,
+            notion_token_env=args.notion_token_env,
         )
         result = Orchestrator().run(config)
         print(f"litflow completed: {result['out_dir']}")
-        print(f"XLSX: {result['outputs']['xlsx']}")
-        print(f"DOCX: {result['outputs']['docx']}")
+        for key, value in result["outputs"].items():
+            print(f"{key.upper()}: {value}")
         return 0
     return 2

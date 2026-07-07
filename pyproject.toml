@@ -11,6 +11,8 @@ dependencies = [
 
 [project.optional-dependencies]
 agents = ["openai-agents"]
+notion = ["notion-client"]
+all = ["openai-agents", "notion-client"]
 
 [tool.setuptools.packages.find]
 include = ["litflow*"]

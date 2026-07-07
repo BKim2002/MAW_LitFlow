@@ -1,0 +1,20 @@
+[project]
+name = "litflow"
+version = "0.1.0"
+description = "Local multi-agent literature search workflow with public scholarly connectors."
+requires-python = ">=3.10"
+dependencies = [
+  "openpyxl",
+  "python-docx",
+  "pydantic",
+]
+
+[project.optional-dependencies]
+agents = ["openai-agents"]
+
+[tool.setuptools.packages.find]
+include = ["litflow*"]
+exclude = ["work*", "outputs*", "tests*"]
+
+[tool.litflow]
+default_language = "ko"

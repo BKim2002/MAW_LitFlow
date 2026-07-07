@@ -115,6 +115,10 @@ def record_to_row(record: Record) -> dict[str, Any]:
         "summary_status": record.summary_status,
         "citation_count": record.citation_count,
         "open_access_pdf": record.open_access_pdf,
+        "found_by": record.found_by,
+        "search_round": record.search_round,
+        "facet_matches": record.facet_matches,
+        "coverage_warning": record.coverage_warning,
     }
 
 

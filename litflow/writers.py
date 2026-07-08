@@ -58,6 +58,7 @@ def write_xlsx(path: Path, records: list[Record], summaries: list[dict[str, Any]
     add_sheet(wb, "Excluded", [record_to_row(r) for r in records if r.inclusion_status == "excluded"])
     add_sheet(wb, "Evidence_Level", [{"record_id": r.record_id, "title": r.title, "evidence_level": r.evidence_level, "open_access_pdf": r.open_access_pdf} for r in records])
     add_sheet(wb, "Deep_Summaries", summaries)
+    add_sheet(wb, "FullText_Requests", read_jsonl(out_dir / "fulltext_requests.jsonl"))
     add_sheet(wb, "QA_Flags", flags)
     wb.save(path)
 

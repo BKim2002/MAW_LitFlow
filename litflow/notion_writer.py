@@ -64,7 +64,7 @@ class NotionPackagingAgent:
                 page_url = page.get("url", notion_page_url(page_id))
             current_children[record_id] = {"page_id": page_id, "url": page_url, "title": child_title}
 
-        child_pages.update(current_children)
+        child_pages = current_children
         hub_blocks = hub_page_blocks(records, summaries, flags, config, out_dir, current_children)
         append_blocks(client, hub_id, hub_blocks)
 
@@ -151,6 +151,7 @@ def hub_page_blocks(
     child_pages: dict[str, dict[str, str]],
 ) -> list[dict[str, Any]]:
     included = [record for record in records if record.inclusion_status == "included"]
+    fulltext_requests = read_jsonl(out_dir / "fulltext_requests.jsonl")
     query_plan = read_json(out_dir / "query_plan.json") if (out_dir / "query_plan.json").exists() else {"queries": []}
     search_logs = read_jsonl(out_dir / "search_log.jsonl")
     manifest = read_json(out_dir / "run_manifest.json") if (out_dir / "run_manifest.json").exists() else {}
@@ -163,17 +164,17 @@ def hub_page_blocks(
         callout(
             "\n".join(
                 [
-                    "실행 요약",
-                    f"주제: {config.topic}",
-                    f"전체 후보 {len(records)}건 | 포함 문헌 {len(included)}건 | 장문 요약 {len(summaries)}건 | QA 플래그 {len(flags)}건",
-                    f"생성 시각: {utc_now()}",
+                    "Run Summary",
+                    f"Topic: {config.topic}",
+                    f"Candidates: {len(records)} | Included: {len(included)} | Full-text summaries: {len(summaries)} | Full-text needed: {len(fulltext_requests)} | QA flags: {len(flags)}",
+                    f"Updated at: {utc_now()}",
                 ]
             ),
             icon="📚",
             color="gray_background",
         ),
         divider(),
-        heading("핵심 문헌 맵", 1),
+        heading("Full-Text Summaries", 1),
     ]
     if summaries:
         for idx, summary in enumerate(summaries, start=1):
@@ -181,14 +182,28 @@ def hub_page_blocks(
             label = f"{idx}. {summary.get('citation') or summary.get('title') or summary.get('record_id')}"
             blocks.append(numbered(label, child.get("url")))
     else:
-        blocks.append(paragraph("장문 요약 대상 문헌이 없습니다."))
+        blocks.append(paragraph("No full-text summaries are available yet. Add PDFs to the user_fulltext folder and run resume-fulltext."))
+
+    blocks.extend([divider(), heading("Full Text Needed", 1)])
+    if fulltext_requests:
+        blocks.append(
+            callout(
+                "These included records were not summarized because extracted full text is not available. Download accessible PDFs into the target folder, preferably using the suggested filename, then run resume-fulltext.",
+                icon="📄",
+                color="yellow_background",
+            )
+        )
+        for row in fulltext_requests[:80]:
+            blocks.append(bulleted(f"P{row.get('priority')} | {row.get('access_hint')} | {row.get('citation')} | file: {row.get('suggested_filename')}"))
+    else:
+        blocks.append(callout("No full-text requests remain.", icon="✅", color="green_background"))
 
     blocks.extend(
         [
             divider(),
-            heading("조사 범위와 실행 설정", 1),
+            heading("Scope And Settings", 1),
             callout(
-                "공개 커넥터 기반 자동 검색 결과입니다. Google Scholar, Scopus, Web of Science, ACM Digital Library, IEEE Xplore 등은 manual_db_search_pack.md의 재현 가능한 검색식으로 별도 확인이 필요합니다.",
+                "Detailed Notion pages are created only for records with extracted full text. Abstract-only and metadata-only records are held in the Full Text Needed queue.",
                 icon="ℹ️",
                 color="gray_background",
             ),
@@ -200,37 +215,37 @@ def hub_page_blocks(
     if sdk_status:
         blocks.append(bulleted(f"agents_sdk: {sdk_status}"))
 
-    blocks.extend([divider(), heading("검색식 요약", 1)])
+    blocks.extend([divider(), heading("Query Summary", 1)])
     for query in query_plan.get("queries", [])[:12]:
         blocks.append(bulleted(f"[{query.get('source')}] {query.get('query')}"))
     if not query_plan.get("queries"):
-        blocks.append(paragraph("검색식 정보가 없습니다."))
+        blocks.append(paragraph("No query plan is available. This may be a resume-only run."))
 
-    blocks.extend([divider(), heading("검색 로그 요약", 1)])
+    blocks.extend([divider(), heading("Search Log Summary", 1)])
     if search_logs:
         for source in sorted(source_counts):
             blocks.append(bulleted(f"{source}: {source_counts[source]} queries, {result_counts[source]} raw results"))
     else:
-        blocks.append(paragraph("검색 로그가 없습니다."))
+        blocks.append(paragraph("No search log is available. Resume-fulltext does not rerun search connectors."))
 
-    blocks.extend([divider(), heading("커버리지 한계", 1)])
+    blocks.extend([divider(), heading("Coverage Audit", 1)])
     coverage_path = out_dir / "coverage_audit.md"
     if coverage_path.exists():
         coverage_lines = []
         for line in coverage_path.read_text(encoding="utf-8").splitlines():
             if line.strip():
                 coverage_lines.append(line.strip().lstrip("# "))
-        blocks.append(callout("\n".join(coverage_lines) if coverage_lines else "커버리지 한계 정보가 없습니다.", icon="🔎", color="gray_background"))
+        blocks.append(callout("\n".join(coverage_lines) if coverage_lines else "No coverage audit details are available.", icon="🔎", color="gray_background"))
     else:
-        blocks.append(paragraph("coverage_audit.md가 아직 생성되지 않았습니다."))
+        blocks.append(paragraph("coverage_audit.md has not been generated yet."))
 
-    blocks.extend([divider(), heading("QA 플래그", 1)])
+    blocks.extend([divider(), heading("QA Flags", 1)])
     if flags:
-        blocks.append(callout(f"검토가 필요한 QA 플래그 {len(flags)}건이 있습니다. 아래 목록에서 record_id와 code를 기준으로 확인하세요.", icon="⚠️", color="gray_background"))
+        blocks.append(callout(f"{len(flags)} QA flags require review.", icon="⚠️", color="gray_background"))
         for item in flags[:50]:
             blocks.append(bulleted(f"{item.get('record_id', '')} | {item.get('code', '')}: {item.get('message', '')}"))
     else:
-        blocks.append(callout("QA 플래그가 없습니다.", icon="✅", color="gray_background"))
+        blocks.append(callout("No QA flags generated.", icon="✅", color="gray_background"))
     return blocks
 
 
@@ -254,28 +269,32 @@ def summary_record_to_blocks(summary: dict[str, Any], record: Record) -> list[di
     ]
     sections = [
         ("Abstract", summary.get("abstract", "")),
-        ("Introduction", summary.get("introduction", "")),
-        ("Method", summary.get("method", "")),
-        ("Results/Findings", summary.get("results_findings", "")),
+        ("연구 목적과 연구 질문", summary.get("research_purpose_questions") or summary.get("introduction", "")),
+        ("이론적 배경과 핵심 개념", summary.get("theoretical_background", "")),
+        ("연구 설계, 데이터, 표본, 맥락", summary.get("study_design_data_sample_context") or summary.get("method", "")),
+        ("측정도구, 변수, 지표", summary.get("measures_variables_indicators", "")),
+        ("분석 방법", summary.get("analysis_methods") or summary.get("method", "")),
+        ("주요 결과", summary.get("key_findings") or summary.get("results_findings", "")),
+        ("논의와 기여", summary.get("discussion_contribution") or summary.get("conclusion", "")),
         ("Conclusion", summary.get("conclusion", "")),
         ("Limitations", summary.get("limitations", "")),
         ("사용자의 주제와의 관련성", summary.get("topic_relevance", "")),
-        ("후속 검토 필요성", summary.get("follow_up", "")),
+        ("후속 검토 포인트", summary.get("follow_up", "")),
     ]
     evidence_level = summary.get("evidence_level") or record.evidence_level
     blocks: list[dict[str, Any]] = [
         callout(
-            f"Evidence Level: {evidence_level}\n이 페이지의 Method/Results 해석은 확보된 근거 수준을 넘지 않도록 제한됩니다.",
+            f"Evidence Level: {evidence_level}\nThis detail page is generated only when extracted full text is available. Claims should remain within the provided full-text evidence.",
             icon="🔎",
             color="gray_background",
         ),
         divider(),
-        heading("문헌 정보", 1),
+        heading("Citation / Metadata", 1),
     ]
     for label, value in metadata:
         if value not in ("", None, []):
             blocks.append(paragraph(f"{label}: {value}", link=str(value) if label == "URL" and value else None))
-    blocks.extend([divider(), heading("구조화 요약", 1)])
+    blocks.extend([divider(), heading("Detailed Structured Summary", 1)])
     for label, value in sections:
         blocks.append(heading(label, 2))
         blocks.extend(paragraph_blocks(str(value or "확인 가능한 내용 없음")))

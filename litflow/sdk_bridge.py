@@ -35,8 +35,15 @@ class LiteratureSummaryOutput(BaseModel):
     summary_status: str = "completed"
     abstract: str
     introduction: str
+    research_purpose_questions: str = ""
+    theoretical_background: str = ""
+    study_design_data_sample_context: str = ""
+    measures_variables_indicators: str = ""
+    analysis_methods: str = ""
     method: str
     results_findings: str
+    key_findings: str = ""
+    discussion_contribution: str = ""
     conclusion: str
     limitations: str
     topic_relevance: str
@@ -174,10 +181,11 @@ class SDKAgentBridge:
             (
                 "You write detailed Korean structured summaries of scholarly papers. "
                 "Use only the provided evidence. If fulltext_sections or fulltext_excerpt are present, "
-                "use that extracted full text as the primary evidence. If evidence_level is metadata_only "
-                "or abstract_only, explicitly say what cannot be verified. Do not invent methods, "
-                "results, or conclusions beyond the available evidence. "
-                "The summary should help a researcher understand the paper's full structure at a glance."
+                "use that extracted full text as the primary evidence. Summarize at a level where a "
+                "researcher can understand the paper without opening it: purpose and questions, theory, "
+                "design/data/sample/context, measures and indicators, analysis methods, key findings, "
+                "discussion and contribution, limitations, and relevance to the user's topic. "
+                "Do not invent methods, results, variables, or conclusions beyond the available full text."
             ),
             LiteratureSummaryOutput,
         )

@@ -28,6 +28,18 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--notion-parent", default=None, help="Notion parent page URL or ID for creating a new run hub page.")
     run.add_argument("--notion-run-page", default=None, help="Existing Notion run hub page URL or ID to update.")
     run.add_argument("--notion-token-env", default="NOTION_TOKEN", help="Environment variable that contains the Notion integration token.")
+    resume = sub.add_parser("resume-fulltext", help="Reuse an existing run and process newly provided full-text files without rerunning search.")
+    resume.add_argument("--out", required=True, help="Existing output directory from a previous run.")
+    resume.add_argument("--topic", default="", help="Optional topic override. Defaults to the previous run topic.")
+    resume.add_argument("--language", default="ko")
+    resume.add_argument("--max-deep", type=int, default=50)
+    resume.add_argument("--user-files", default=None, help="Directory containing user-provided PDF/TXT/MD full text. Defaults to <out>/user_fulltext.")
+    resume.add_argument("--agent-mode", choices=["auto", "sdk", "off"], default="auto", help="Use Agents SDK for newly summarized full-text records.")
+    resume.add_argument("--agent-model", default=None, help="Optional OpenAI model name for Agents SDK runs.")
+    resume.add_argument("--output-format", choices=["files", "notion", "both"], default="files", help="Final packaging target for the resumed run.")
+    resume.add_argument("--notion-parent", default=None, help="Notion parent page URL or ID for creating a new run hub page if no manifest exists.")
+    resume.add_argument("--notion-run-page", default=None, help="Existing Notion run hub page URL or ID to update.")
+    resume.add_argument("--notion-token-env", default="NOTION_TOKEN", help="Environment variable that contains the Notion integration token.")
     return parser
 
 
@@ -55,6 +67,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         result = Orchestrator().run(config)
         print(f"litflow completed: {result['out_dir']}")
+        for key, value in result["outputs"].items():
+            print(f"{key.upper()}: {value}")
+        return 0
+    if args.command == "resume-fulltext":
+        config = RunConfig(
+            topic=args.topic,
+            out=str(Path(args.out)),
+            language=args.language,
+            max_deep=args.max_deep,
+            user_files=args.user_files,
+            agent_mode=args.agent_mode,
+            agent_model=args.agent_model,
+            output_format=args.output_format,
+            notion_parent=args.notion_parent,
+            notion_run_page=args.notion_run_page,
+            notion_token_env=args.notion_token_env,
+        )
+        result = Orchestrator().resume_fulltext(config)
+        print(f"litflow resume-fulltext completed: {result['out_dir']}")
         for key, value in result["outputs"].items():
             print(f"{key.upper()}: {value}")
         return 0

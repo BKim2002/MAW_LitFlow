@@ -88,6 +88,31 @@ python -m litflow run `
   --notion-parent "https://app.notion.com/p/LitSearch-3963ec09355b80d08e6ff804d8b01bab?source=copy_link"
 ```
 
+## Resume Full Text
+
+Use `resume-fulltext` after the first run has created `fulltext_requests.*` and
+you have added PDFs to the run's `user_fulltext` folder. This command skips all
+search stages and only reruns full-text extraction, full-text summaries, QA, and
+packaging.
+
+```powershell
+python -m litflow resume-fulltext `
+  --out outputs/litflow_AL_JP `
+  --agent-mode sdk `
+  --output-format notion
+```
+
+Useful `resume-fulltext` options:
+
+| Option | Default | When to use |
+|---|---:|---|
+| `--out` | required | Existing run directory containing `screened_records.jsonl`. |
+| `--user-files` | `<out>/user_fulltext` | Use when PDFs are stored somewhere else. |
+| `--max-deep` | `50` | Maximum number of full-text records to summarize. |
+| `--agent-mode` | `auto` | Use `sdk` to require Agents SDK summaries for newly available full-text papers. |
+| `--output-format` | previous run or `files` | Use `notion` to update the Notion hub and full-text paper pages. |
+| `--notion-run-page` | none | Explicitly update a known Notion hub when `notion_manifest.json` is missing. |
+
 ## Notion Output
 
 Install the optional Notion dependency and set a Notion integration token:
@@ -106,16 +131,17 @@ python -m litflow run --topic "AI literacy and job performance" --out outputs/ai
 Output modes:
 
 - `--output-format files`: create the local XLSX and DOCX files only. This is the default.
-- `--output-format notion`: create or update a Notion run hub page and paper subpages only.
+- `--output-format notion`: create or update a Notion run hub page and full-text paper subpages only.
 - `--output-format both`: create local files and Notion pages.
 
 Notion reruns use `notion_manifest.json` inside the output directory. If the
 manifest exists, litflow updates the same hub and paper pages. You can also pass
 `--notion-run-page` to update an existing hub page explicitly.
 
-The Notion output uses native Notion blocks to keep the result calm and scannable:
-summary callouts, dividers, clear heading hierarchy, a paper-link map, and
-evidence-level callouts on each paper page.
+The Notion output is full-text gated. Paper detail pages are created only for
+records with extracted `fulltext_pdf` or `user_provided_fulltext` evidence.
+Included records that only have abstracts or metadata stay in the hub page's
+`Full Text Needed` queue and in the local request files.
 
 ## PDF Full Text
 
@@ -125,6 +151,42 @@ sections to the summary agent. When extraction succeeds, the record evidence lev
 becomes `fulltext_pdf`; otherwise it falls back to abstract or metadata evidence.
 Publisher login walls, bot protection, and non-PDF HTML full text can still prevent
 automatic extraction even when the paper is readable in a browser.
+
+Only extracted full text is summarized into detail pages. If automatic PDF
+extraction fails, litflow writes a request queue:
+
+- `fulltext_requests.jsonl`
+- `fulltext_requests.csv`
+- `fulltext_requests.md`
+
+By default, user-provided full-text files should be placed in:
+
+```powershell
+.\outputs\<run_id>\user_fulltext
+```
+
+Use the suggested filename in `fulltext_requests.md` when possible. Matching is
+based on DOI and normalized title, so exact filenames are helpful but not always
+required.
+
+After adding PDFs, resume without rerunning search:
+
+```powershell
+python -m litflow resume-fulltext `
+  --out outputs/ai-literacy `
+  --agent-mode sdk `
+  --output-format notion
+```
+
+`resume-fulltext` reuses `screened_records.jsonl`, existing evidence bundles,
+summaries, and `notion_manifest.json`. It does not rerun OpenAlex, Crossref,
+Semantic Scholar, arXiv, or SerpAPI search queries.
+
+You can point to a different user full-text folder:
+
+```powershell
+python -m litflow resume-fulltext --out outputs/ai-literacy --user-files "C:\path\to\pdfs" --output-format notion
+```
 
 ## High-Recall Search
 
@@ -144,7 +206,8 @@ Search proceeds in rounds:
 
 Every candidate keeps `found_by`, `search_round`, `facet_matches`, and
 `coverage_warning` fields. These fields appear in `screened_records.jsonl`, the
-XLSX candidate sheets, and Notion paper pages. `coverage_audit.md` summarizes
+XLSX candidate sheets, and Notion paper pages when full text is available.
+`coverage_audit.md` summarizes
 facet coverage, weak concept combinations, search rounds, source counts, and
 remaining manual database gaps.
 
@@ -171,6 +234,10 @@ warning to `search_log.jsonl` and continues with the public scholarly connectors
 - `screened_records.jsonl`
 - `evidence_bundles/*.json`
 - `fulltext_pdfs/*.pdf` when PDF extraction succeeds
+- `user_fulltext/` default folder for user-provided PDFs
+- `fulltext_requests.jsonl`
+- `fulltext_requests.csv`
+- `fulltext_requests.md`
 - `summaries.jsonl`
 - `qa_flags.jsonl`
 - `coverage_audit.md`

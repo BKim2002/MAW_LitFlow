@@ -5,6 +5,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import csv
 from collections import Counter
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -31,8 +32,9 @@ from .sdk_bridge import SDKAgentBridge
 
 
 MAX_PDF_BYTES = 30 * 1024 * 1024
-MAX_FULLTEXT_CHARS = 24000
-MAX_SECTION_CHARS = 6000
+MAX_FULLTEXT_CHARS = 50000
+MAX_SECTION_CHARS = 12000
+FULLTEXT_EVIDENCE_LEVELS = {"fulltext_pdf", "user_provided_fulltext"}
 REQUEST_HEADERS = {
     "User-Agent": "litflow/0.1 (mailto:research@example.com)",
     "Accept": "application/pdf,text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
@@ -499,7 +501,9 @@ class EvidenceAcquisitionAgent:
     def run(self, records: list[Record], config: RunConfig, out_dir: Path) -> dict[str, Any]:
         evidence_dir = ensure_dir(out_dir / "evidence_bundles")
         pdf_dir = ensure_dir(out_dir / "fulltext_pdfs")
-        user_files = list(Path(config.user_files).glob("*")) if config.user_files and Path(config.user_files).exists() else []
+        user_dir = user_fulltext_dir(config, out_dir)
+        ensure_dir(user_dir)
+        user_files = list(user_dir.glob("*")) if user_dir.exists() else []
         included = [r for r in records if r.inclusion_status == "included"]
         included.sort(key=lambda r: (r.relevance_score, r.citation_count or 0), reverse=True)
         fulltext_targets = {r.record_id for r in included[: config.max_deep]}
@@ -540,6 +544,7 @@ class EvidenceAcquisitionAgent:
                 "fulltext_chars": fulltext.get("char_count", 0),
                 "fulltext_excerpt": fulltext.get("excerpt", ""),
                 "fulltext_sections": fulltext.get("sections", {}),
+                "user_fulltext_dir": str(user_dir),
                 "summary_constraints": summary_constraints(level),
             }
             bundle_index[record.record_id] = bundle
@@ -554,13 +559,32 @@ class DeepSummaryAgent:
     def __init__(self, sdk_bridge: SDKAgentBridge | None = None):
         self.sdk_bridge = sdk_bridge
 
-    def run(self, records: list[Record], evidence: dict[str, dict[str, Any]], config: RunConfig, out_dir: Path) -> list[dict[str, Any]]:
+    def run(
+        self,
+        records: list[Record],
+        evidence: dict[str, dict[str, Any]],
+        config: RunConfig,
+        out_dir: Path,
+        reuse_existing: bool = False,
+    ) -> list[dict[str, Any]]:
         included = [r for r in records if r.inclusion_status == "included"]
-        included.sort(key=lambda r: (r.relevance_score, r.citation_count or 0), reverse=True)
-        selected = included[: config.max_deep]
-        summaries: list[dict[str, Any]] = []
+        fulltext_included = [r for r in included if is_fulltext_evidence(evidence.get(r.record_id, {}).get("evidence_level", r.evidence_level))]
+        fulltext_included.sort(key=lambda r: (r.relevance_score, r.citation_count or 0), reverse=True)
+        selected = fulltext_included[: config.max_deep]
+        existing_by_id: dict[str, dict[str, Any]] = {}
+        if reuse_existing:
+            for summary in read_jsonl(out_dir / "summaries.jsonl"):
+                record_id = summary.get("record_id", "")
+                if is_fulltext_evidence(summary.get("evidence_level", "")):
+                    existing_by_id[record_id] = summary
+        summaries_by_id: dict[str, dict[str, Any]] = {}
         for record in selected:
             bundle = evidence.get(record.record_id, {})
+            existing = existing_by_id.get(record.record_id)
+            if existing and is_fulltext_evidence(bundle.get("evidence_level", record.evidence_level)):
+                summaries_by_id[record.record_id] = existing
+                record.summary_status = "completed"
+                continue
             if self.sdk_bridge and self.sdk_bridge.enabled:
                 try:
                     summary_model = self.sdk_bridge.summarize_record(config.topic, record, bundle, format_citation(record))
@@ -571,14 +595,32 @@ class DeepSummaryAgent:
                     summary = build_summary(record, bundle)
             else:
                 summary = build_summary(record, bundle)
-            summaries.append(summary)
+            summaries_by_id[record.record_id] = summary
             record.summary_status = "completed"
         for record in records:
-            if record.inclusion_status == "included" and record.summary_status != "completed":
+            if record.inclusion_status != "included":
+                continue
+            if record.summary_status == "completed":
+                continue
+            if not is_fulltext_evidence(evidence.get(record.record_id, {}).get("evidence_level", record.evidence_level)):
+                record.summary_status = "needs_user_fulltext"
+            else:
                 record.summary_status = "deferred_max_deep"
+        summaries = [summaries_by_id[record.record_id] for record in selected if record.record_id in summaries_by_id]
         write_jsonl(out_dir / "summaries.jsonl", summaries)
         write_jsonl(out_dir / "screened_records.jsonl", [record.to_dict() for record in records])
         return summaries
+
+
+class FullTextRequestAgent:
+    name = "FullTextRequestAgent"
+
+    def run(self, records: list[Record], evidence: dict[str, dict[str, Any]], config: RunConfig, out_dir: Path) -> list[dict[str, Any]]:
+        rows = fulltext_request_rows(records, evidence, config, out_dir)
+        write_jsonl(out_dir / "fulltext_requests.jsonl", rows)
+        write_fulltext_requests_csv(out_dir / "fulltext_requests.csv", rows)
+        write_fulltext_requests_md(out_dir / "fulltext_requests.md", rows, config, out_dir)
+        return rows
 
 
 class QualityAuditAgent:
@@ -848,6 +890,148 @@ def score_record(record: Record, terms: list[str]) -> tuple[int, str]:
     if unique_hits >= 1:
         return 1, "Only weak topical overlap."
     return 0, "No topical overlap with expanded query terms."
+
+
+def is_fulltext_evidence(level: str) -> bool:
+    return str(level or "") in FULLTEXT_EVIDENCE_LEVELS
+
+
+def user_fulltext_dir(config: RunConfig, out_dir: Path) -> Path:
+    return Path(config.user_files) if config.user_files else out_dir / "user_fulltext"
+
+
+def fulltext_request_rows(records: list[Record], evidence: dict[str, dict[str, Any]], config: RunConfig, out_dir: Path) -> list[dict[str, Any]]:
+    rows = []
+    target_dir = user_fulltext_dir(config, out_dir)
+    for record in records:
+        if record.inclusion_status != "included":
+            continue
+        bundle = evidence.get(record.record_id, {})
+        level = bundle.get("evidence_level", record.evidence_level)
+        if is_fulltext_evidence(level):
+            continue
+        hint = access_hint(record, bundle)
+        rows.append(
+            {
+                "record_id": record.record_id,
+                "citation": format_citation(record),
+                "title": record.title,
+                "doi": record.doi,
+                "url": record.url,
+                "open_access_pdf": bundle.get("open_access_pdf", record.open_access_pdf),
+                "evidence_level": level,
+                "fulltext_status": bundle.get("fulltext_status", "not_attempted"),
+                "fulltext_error": bundle.get("fulltext_error", ""),
+                "access_hint": hint,
+                "priority": access_priority(hint),
+                "suggested_filename": suggested_fulltext_filename(record),
+                "target_folder": str(target_dir),
+                "search_queries": search_queries_for_fulltext(record),
+            }
+        )
+    rows.sort(key=lambda row: (int(row["priority"]), str(row["citation"]).lower()))
+    return rows
+
+
+def access_hint(record: Record, bundle: dict[str, Any]) -> str:
+    status = str(bundle.get("fulltext_status", ""))
+    error = str(bundle.get("fulltext_error", "")).lower()
+    open_pdf = bundle.get("open_access_pdf") or record.open_access_pdf
+    if status == "failed" and open_pdf:
+        return "download_failed"
+    if status == "no_pdf_url":
+        return "no_pdf_discovered"
+    if open_pdf and status not in {"completed", "failed"}:
+        return "maybe_oa_unextracted"
+    if any(token in error for token in ["403", "401", "paywall", "forbidden", "unauthorized", "needaccess"]):
+        return "likely_paywalled"
+    if record.url and any(host in record.url.lower() for host in ["sciencedirect.com", "springer.com", "tandfonline.com", "wiley.com", "sagepub.com"]):
+        return "unknown"
+    return "unknown"
+
+
+def access_priority(hint: str) -> int:
+    return {
+        "download_failed": 1,
+        "maybe_oa_unextracted": 2,
+        "no_pdf_discovered": 2,
+        "unknown": 3,
+        "likely_paywalled": 4,
+    }.get(hint, 3)
+
+
+def suggested_fulltext_filename(record: Record) -> str:
+    base = record.doi.replace("/", "_").replace(".", "_") if record.doi else normalize_title(record.title)
+    base = re.sub(r"[^A-Za-z0-9가-힣._-]+", "_", base).strip("._-")
+    return (base[:120] or record.record_id) + ".pdf"
+
+
+def search_queries_for_fulltext(record: Record) -> list[str]:
+    queries = []
+    if record.title:
+        queries.extend([f'"{record.title}" pdf', f'"{record.title}" filetype:pdf'])
+    if record.doi:
+        queries.append(f'"{record.doi}" pdf')
+    if record.authors and record.year:
+        queries.append(f'"{record.title}" {record.authors[0]} {record.year} pdf')
+    return compact_list(queries)[:4]
+
+
+def write_fulltext_requests_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    ensure_dir(path.parent)
+    headers = [
+        "priority",
+        "access_hint",
+        "citation",
+        "title",
+        "doi",
+        "url",
+        "open_access_pdf",
+        "evidence_level",
+        "fulltext_status",
+        "fulltext_error",
+        "suggested_filename",
+        "target_folder",
+        "search_queries",
+        "record_id",
+    ]
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({header: row.get(header, "") if not isinstance(row.get(header), list) else " | ".join(row[header]) for header in headers})
+
+
+def write_fulltext_requests_md(path: Path, rows: list[dict[str, Any]], config: RunConfig, out_dir: Path) -> None:
+    lines = [
+        "# Full Text Needed",
+        "",
+        f"Topic: {config.topic}",
+        f"Target folder: `{user_fulltext_dir(config, out_dir)}`",
+        "",
+        "Only records with extracted full text are summarized into Notion detail pages. Download accessible PDFs into the target folder using the suggested filename when possible, then run `python -m litflow resume-fulltext --out <same_out>`.",
+        "",
+    ]
+    if not rows:
+        lines.append("No full-text requests remain.")
+    for idx, row in enumerate(rows, start=1):
+        lines.extend(
+            [
+                f"## {idx}. {row['citation']}",
+                "",
+                f"- record_id: `{row['record_id']}`",
+                f"- access_hint: `{row['access_hint']}` | priority: {row['priority']}",
+                f"- suggested_filename: `{row['suggested_filename']}`",
+                f"- DOI: {row['doi'] or 'n/a'}",
+                f"- URL: {row['url'] or 'n/a'}",
+                f"- open_access_pdf: {row['open_access_pdf'] or 'n/a'}",
+                "- search_queries:",
+            ]
+        )
+        for query in row["search_queries"]:
+            lines.append(f"  - `{query}`")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def match_record_facets(record: Record, concept_groups: dict[str, list[str]], existing: list[str] | None = None) -> list[str]:
@@ -1264,6 +1448,13 @@ def build_summary(record: Record, bundle: dict[str, Any]) -> dict[str, Any]:
         conclusion_text = "결론은 초록에 직접 제시된 주장으로 제한합니다. 고위험 의사결정에 사용하려면 원문 검토가 필요합니다."
         limitations_text = base_note
     relevance = f"검색 주제와의 관련성 점수는 {record.relevance_score}/3입니다. 제목, 초록, 출처 메타데이터의 키워드 중첩을 기준으로 자동 판정했습니다."
+    purpose_text = sections.get("introduction") or introduction_text
+    theory_text = sections.get("introduction") or sections.get("discussion") or "원문은 확보되었지만 이론적 배경 섹션을 자동으로 안정 분리하지 못했습니다."
+    design_text = sections.get("method") or method_text
+    measures_text = sections.get("method") or "측정도구, 변수, 지표 정보는 추출 원문에서 수동 재확인이 필요합니다."
+    analysis_text = sections.get("method") or "분석 방법 정보는 추출 원문에서 수동 재확인이 필요합니다."
+    findings_detail = sections.get("results_findings") or sections.get("discussion") or findings_text
+    discussion_text = sections.get("discussion") or sections.get("conclusion") or conclusion_text
     return {
         "record_id": record.record_id,
         "citation": format_citation(record),
@@ -1272,8 +1463,15 @@ def build_summary(record: Record, bundle: dict[str, Any]) -> dict[str, Any]:
         "summary_status": "completed",
         "abstract": abstract_summary,
         "introduction": introduction_text,
+        "research_purpose_questions": purpose_text,
+        "theoretical_background": theory_text,
+        "study_design_data_sample_context": design_text,
+        "measures_variables_indicators": measures_text,
+        "analysis_methods": analysis_text,
         "method": method_text,
         "results_findings": findings_text,
+        "key_findings": findings_detail,
+        "discussion_contribution": discussion_text,
         "conclusion": conclusion_text,
         "limitations": limitations_text,
         "topic_relevance": relevance,

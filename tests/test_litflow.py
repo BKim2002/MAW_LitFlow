@@ -12,6 +12,7 @@ from litflow.agents import (
     CoverageAuditAgent,
     DeepSummaryAgent,
     EvidenceAcquisitionAgent,
+    FullTextRequestAgent,
     IntakeScopeAgent,
     MetadataNormalizeDedupAgent,
     QualityAuditAgent,
@@ -36,6 +37,13 @@ class FakeConnector(BaseConnector):
     def search(self, query: str, config: RunConfig, limit: int) -> SearchResult:
         rows = [RawRecord(**{**r.to_dict(), "source": self.source, "source_database": self.source}) for r in self.records[:limit]]
         return SearchResult(rows, SearchLogEntry(self.source, query, utc_now(), f"fake://{self.source}", len(rows)))
+
+
+class ExplodingConnector(BaseConnector):
+    source = "explode"
+
+    def search(self, query: str, config: RunConfig, limit: int) -> SearchResult:
+        raise AssertionError("resume-fulltext must not call search connectors")
 
 
 class FakeSDKBridge:
@@ -261,7 +269,7 @@ class LitflowTests(unittest.TestCase):
             self.assertEqual(report["duplicate_count"], 1)
             self.assertEqual(set(records[0].source_database), {"openalex", "crossref"})
 
-    def test_evidence_summary_marks_abstract_only_constraints(self):
+    def test_abstract_only_record_is_not_deep_summarized_and_gets_request(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             record = Record(
@@ -275,8 +283,14 @@ class LitflowTests(unittest.TestCase):
             evidence = EvidenceAcquisitionAgent().run([record], config, out)
             summaries = DeepSummaryAgent().run([record], evidence, config, out)
             self.assertEqual(record.evidence_level, "abstract_only")
-            self.assertIn("초록", summaries[0]["method"])
-            self.assertIn("추정하지 않습니다", summaries[0]["results_findings"])
+            self.assertEqual(summaries, [])
+            self.assertEqual(record.summary_status, "needs_user_fulltext")
+            requests = FullTextRequestAgent().run([record], evidence, config, out)
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(requests[0]["record_id"], "r1")
+            self.assertTrue((out / "fulltext_requests.jsonl").exists())
+            self.assertTrue((out / "fulltext_requests.csv").exists())
+            self.assertTrue((out / "fulltext_requests.md").exists())
 
     def test_evidence_acquisition_extracts_pdf_fulltext_for_deep_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,7 +376,7 @@ AI literacy should be developed through training.
             wb = load_workbook(outputs["xlsx"], read_only=True)
             try:
                 self.assertEqual(
-                    set(["Run_Config", "Search_Log", "Queries", "All_Candidates", "Included", "Excluded", "Evidence_Level", "Deep_Summaries", "QA_Flags"]),
+                    set(["Run_Config", "Search_Log", "Queries", "All_Candidates", "Included", "Excluded", "Evidence_Level", "Deep_Summaries", "FullText_Requests", "QA_Flags"]),
                     set(wb.sheetnames),
                 )
             finally:
@@ -402,6 +416,38 @@ AI literacy should be developed through training.
             self.assertGreaterEqual(included[0]["search_round"], 1)
             self.assertIn("facet_matches", included[0])
 
+    def test_resume_fulltext_uses_existing_records_without_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "run"
+            out.mkdir()
+            record = Record(
+                record_id="r1",
+                title="AI Literacy Full Text Study",
+                authors=["Kim"],
+                year=2026,
+                doi="10.123/fulltext",
+                relevance_score=3,
+                inclusion_status="included",
+                evidence_level="abstract_only",
+            )
+            write_jsonl(out / "screened_records.jsonl", [record.to_dict()])
+            write_json(out / "run_manifest.json", {"topic": "AI literacy", "config": {"topic": "AI literacy", "output_format": "files"}, "stages": []})
+            user_dir = out / "user_fulltext"
+            user_dir.mkdir()
+            (user_dir / "10_123_fulltext.pdf").write_bytes(b"%PDF fake")
+            with patch("litflow.agents.extract_pdf_text", return_value="Abstract\nFull text.\n\nMethods\nSurvey method.\n\nResults\nPositive result."):
+                result = Orchestrator({"explode": ExplodingConnector()}).resume_fulltext(
+                    RunConfig(topic="", out=str(out), output_format="files", agent_mode="off")
+                )
+            self.assertTrue(Path(result["outputs"]["xlsx"]).exists())
+            summaries = read_jsonl(out / "summaries.jsonl")
+            self.assertEqual(len(summaries), 1)
+            requests = read_jsonl(out / "fulltext_requests.jsonl")
+            self.assertEqual(requests, [])
+            updated = read_jsonl(out / "screened_records.jsonl")[0]
+            self.assertEqual(updated["evidence_level"], "user_provided_fulltext")
+            self.assertEqual(updated["summary_status"], "completed")
+
     def test_sdk_assisted_agents_use_bridge_outputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
@@ -415,10 +461,12 @@ AI literacy should be developed through training.
                 record_id="r1",
                 title="Large Language Models for Interview Assessment",
                 abstract="LLM interview assessment validity.",
+                open_access_pdf="https://example.test/sdk.pdf",
             )
             records = RelevanceScreeningAgent(bridge).run([record], scope, out)
             self.assertEqual(records[0].relevance_score, 3)
-            evidence = EvidenceAcquisitionAgent().run(records, config, out)
+            with patch("litflow.agents.download_pdf", return_value=out / "sdk.pdf"), patch("litflow.agents.extract_pdf_text", return_value="Abstract\nSDK full text.\n\nMethods\nA method section."):
+                evidence = EvidenceAcquisitionAgent().run(records, config, out)
             summaries = DeepSummaryAgent(bridge).run(records, evidence, config, out)
             self.assertEqual(summaries[0]["abstract"], "SDK abstract summary")
             flags = QualityAuditAgent(bridge).run(records, summaries, out, config.topic)
@@ -480,8 +528,9 @@ AI literacy should be developed through training.
             self.assertIn("divider", block_types)
             self.assertLess(block_types.index("heading_1"), len(block_types))
             rendered = str(blocks)
-            self.assertIn("실행 요약", rendered)
-            self.assertIn("핵심 문헌 맵", rendered)
+            self.assertIn("Run Summary", rendered)
+            self.assertIn("Full-Text Summaries", rendered)
+            self.assertIn("Full Text Needed", rendered)
             self.assertIn("https://notion.test/paper", rendered)
 
     def test_notion_packaging_creates_and_updates_manifest_pages(self):
@@ -535,6 +584,53 @@ AI literacy should be developed through training.
             self.assertEqual(updated["child_pages"]["r1"]["page_id"], child_id)
             self.assertIn(hub_id, fake.updated_pages)
             self.assertIn(child_id, fake.updated_pages)
+
+    def test_notion_packaging_only_creates_child_pages_for_summaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            write_json(out / "query_plan.json", {"queries": []})
+            write_jsonl(out / "search_log.jsonl", [])
+            write_json(out / "run_manifest.json", {"agents_sdk": {"enabled": False}})
+            write_jsonl(
+                out / "fulltext_requests.jsonl",
+                [
+                    {
+                        "record_id": "missing",
+                        "citation": "Lee (2026). Missing Full Text.",
+                        "access_hint": "no_pdf_discovered",
+                        "priority": 2,
+                        "suggested_filename": "missing.pdf",
+                    }
+                ],
+            )
+            fulltext_record = Record(record_id="full", title="Full Text Paper", inclusion_status="included", evidence_level="fulltext_pdf")
+            missing_record = Record(record_id="missing", title="Missing Full Text", inclusion_status="included", evidence_level="abstract_only", summary_status="needs_user_fulltext")
+            summary = {
+                "record_id": "full",
+                "citation": "Kim (2026). Full Text Paper.",
+                "title": "Full Text Paper",
+                "evidence_level": "fulltext_pdf",
+                "abstract": "Abstract",
+                "research_purpose_questions": "Purpose",
+                "theoretical_background": "Theory",
+                "study_design_data_sample_context": "Design",
+                "measures_variables_indicators": "Measures",
+                "analysis_methods": "Analysis",
+                "key_findings": "Findings",
+                "discussion_contribution": "Discussion",
+                "conclusion": "Conclusion",
+                "limitations": "Limitations",
+                "topic_relevance": "Relevant",
+                "follow_up": "Follow up",
+            }
+            fake = FakeNotionClient()
+            config = RunConfig(topic="AI assessment", out=tmp, output_format="notion", notion_parent="1234567890abcdef1234567890abcdef")
+            PackagingAgent(notion_client=fake).run([fulltext_record, missing_record], [summary], [], config, out)
+            manifest = read_json(out / "notion_manifest.json")
+            self.assertEqual(set(manifest["child_pages"].keys()), {"full"})
+            hub_blocks = str(fake.children[manifest["hub_page_id"]])
+            self.assertIn("Full Text Needed", hub_blocks)
+            self.assertIn("Missing Full Text", hub_blocks)
 
     def test_notion_packaging_requires_token_or_parent(self):
         with tempfile.TemporaryDirectory() as tmp:

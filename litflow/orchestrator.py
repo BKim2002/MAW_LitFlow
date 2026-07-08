@@ -8,6 +8,7 @@ from .agents import (
     CoverageAuditAgent,
     DeepSummaryAgent,
     EvidenceAcquisitionAgent,
+    FullTextRequestAgent,
     IntakeScopeAgent,
     MetadataNormalizeDedupAgent,
     ParallelSearchAgent,
@@ -19,7 +20,7 @@ from .agents import (
 from .connectors import BaseConnector, SemanticScholarConnector, default_connectors
 from .models import Record, RunConfig
 from .sdk_bridge import SDKAgentBridge
-from .utils import ensure_dir, make_run_id, utc_now, write_json
+from .utils import ensure_dir, make_run_id, read_json, read_jsonl, utc_now, write_json
 from .writers import PackagingAgent
 
 
@@ -65,12 +66,53 @@ class Orchestrator:
             coverage_report = self._stage(manifest, out_dir, "coverage_audit_after_snowball", lambda: CoverageAuditAgent().run(records, query_plan, config, out_dir, allow_supplemental=False))
         evidence = self._stage(manifest, out_dir, "evidence_acquisition", lambda: EvidenceAcquisitionAgent().run(records, config, out_dir))
         summaries = self._stage(manifest, out_dir, "deep_summary", lambda: DeepSummaryAgent(sdk_bridge).run(records, evidence, config, out_dir))
+        fulltext_requests = self._stage(manifest, out_dir, "fulltext_requests", lambda: FullTextRequestAgent().run(records, evidence, config, out_dir))
         flags = self._stage(manifest, out_dir, "quality_audit", lambda: QualityAuditAgent(sdk_bridge).run(records, summaries, out_dir, config.topic))
         outputs = self._stage(manifest, out_dir, "packaging", lambda: PackagingAgent().run(records, summaries, flags, config, out_dir))
         manifest["outputs"] = outputs
         manifest["dedup_report"] = dedup_report
+        manifest["fulltext_requests"] = {"count": len(fulltext_requests)}
         manifest["completed_at"] = utc_now()
         write_json(out_dir / "run_manifest.json", manifest)
+        return {"out_dir": str(out_dir), "outputs": outputs, "records": [r.to_dict() for r in records]}
+
+    def resume_fulltext(self, config: RunConfig) -> dict[str, Any]:
+        out_dir = Path(config.out)
+        if not out_dir.exists():
+            raise RuntimeError(f"Output directory does not exist: {out_dir}")
+        manifest_path = out_dir / "run_manifest.json"
+        manifest = read_json(manifest_path) if manifest_path.exists() else {
+            "run_id": out_dir.name,
+            "created_at": utc_now(),
+            "topic": config.topic,
+            "config": config.to_dict(),
+            "connector_status": {},
+            "stages": [],
+        }
+        previous_config = manifest.get("config") or {}
+        if not config.topic:
+            config.topic = manifest.get("topic") or previous_config.get("topic") or ""
+        if config.output_format == "files" and previous_config.get("output_format"):
+            config.output_format = previous_config.get("output_format")
+        manifest["topic"] = config.topic
+        manifest["resume_config"] = config.to_dict()
+        sdk_bridge = SDKAgentBridge(config)
+        manifest["agents_sdk"] = sdk_bridge.status()
+        write_json(manifest_path, manifest)
+
+        rows = read_jsonl(out_dir / "screened_records.jsonl")
+        if not rows:
+            raise RuntimeError(f"No screened_records.jsonl found in {out_dir}; run `python -m litflow run` first.")
+        records = [Record.from_dict(row) for row in rows]
+        evidence = self._stage(manifest, out_dir, "resume_evidence_acquisition", lambda: EvidenceAcquisitionAgent().run(records, config, out_dir))
+        summaries = self._stage(manifest, out_dir, "resume_deep_summary", lambda: DeepSummaryAgent(sdk_bridge).run(records, evidence, config, out_dir, reuse_existing=True))
+        fulltext_requests = self._stage(manifest, out_dir, "resume_fulltext_requests", lambda: FullTextRequestAgent().run(records, evidence, config, out_dir))
+        flags = self._stage(manifest, out_dir, "resume_quality_audit", lambda: QualityAuditAgent(sdk_bridge).run(records, summaries, out_dir, config.topic))
+        outputs = self._stage(manifest, out_dir, "resume_packaging", lambda: PackagingAgent().run(records, summaries, flags, config, out_dir))
+        manifest["outputs"] = outputs
+        manifest["fulltext_requests"] = {"count": len(fulltext_requests)}
+        manifest["resume_completed_at"] = utc_now()
+        write_json(manifest_path, manifest)
         return {"out_dir": str(out_dir), "outputs": outputs, "records": [r.to_dict() for r in records]}
 
     def _stage(self, manifest: dict[str, Any], out_dir: Path, name: str, func):
